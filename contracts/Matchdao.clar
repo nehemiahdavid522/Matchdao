@@ -18,6 +18,12 @@
 (define-constant ERR_INSUFFICIENT_REPUTATION (err u111))
 (define-constant ERR_REWARD_ALREADY_CLAIMED (err u112))
 (define-constant ERR_NO_REWARDS_AVAILABLE (err u113))
+(define-constant ERR_IMPACT_REPORT_EXISTS (err u114))
+(define-constant ERR_IMPACT_REPORT_NOT_FOUND (err u115))
+(define-constant ERR_VERIFICATION_ENDED (err u116))
+(define-constant ERR_VERIFICATION_ACTIVE (err u117))
+(define-constant ERR_ALREADY_VERIFIED (err u118))
+(define-constant ERR_INSUFFICIENT_IMPACT_SCORE (err u119))
 
 (define-data-var next-campaign-id uint u1)
 (define-data-var dao-treasury uint u0)
@@ -25,6 +31,8 @@
 (define-data-var voting-period uint u1440)
 (define-data-var reward-pool uint u0)
 (define-data-var total-reputation-points uint u0)
+(define-data-var next-impact-report-id uint u1)
+(define-data-var verification-period uint u1008)
 
 (define-map campaigns
   uint
@@ -120,6 +128,68 @@
     campaign-master: bool,
     loyalty-badge: bool
   }
+)
+
+;; Impact reporting and verification system
+(define-map impact-reports
+  uint
+  {
+    campaign-id: uint,
+    creator: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 1000),
+    evidence-url: (string-ascii 500),
+    funds-used: uint,
+    beneficiaries-reached: uint,
+    submission-block: uint,
+    verification-end-block: uint,
+    verification-votes-for: uint,
+    verification-votes-against: uint,
+    total-verification-stake: uint,
+    verified: bool,
+    impact-score: uint,
+    active: bool
+  }
+)
+
+(define-map impact-verifications
+  { report-id: uint, verifier: principal }
+  { 
+    vote: bool, 
+    stake: uint, 
+    evidence-provided: bool,
+    verification-comments: (string-ascii 200),
+    block-height: uint 
+  }
+)
+
+(define-map campaign-impact-history
+  uint
+  {
+    total-reports: uint,
+    verified-reports: uint,
+    average-impact-score: uint,
+    total-funds-tracked: uint,
+    total-beneficiaries: uint,
+    trust-rating: uint
+  }
+)
+
+(define-map creator-impact-record
+  principal
+  {
+    total-reports-submitted: uint,
+    verified-reports: uint,
+    cumulative-impact-score: uint,
+    reliability-score: uint,
+    eligible-for-matching: bool,
+    last-report-block: uint
+  }
+)
+
+(define-map impact-verifiers
+  uint
+  (list 50 principal)
 )
 
 (define-private (initialize-tier-system)
@@ -448,6 +518,183 @@
   )
 )
 
+;; Impact verification system functions
+(define-public (submit-impact-report 
+  (campaign-id uint) 
+  (title (string-ascii 100)) 
+  (description (string-ascii 1000)) 
+  (evidence-url (string-ascii 500)) 
+  (funds-used uint) 
+  (beneficiaries-reached uint))
+  (let ((campaign (unwrap! (map-get? campaigns campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+        (report-id (var-get next-impact-report-id))
+        (verification-end (+ stacks-block-height (var-get verification-period)))
+        (creator-record (default-to { total-reports-submitted: u0, verified-reports: u0, cumulative-impact-score: u0, reliability-score: u0, eligible-for-matching: true, last-report-block: u0 } 
+                                    (map-get? creator-impact-record tx-sender))))
+    
+    ;; Only campaign creator can submit impact reports
+    (asserts! (is-eq tx-sender (get creator campaign)) ERR_NOT_AUTHORIZED)
+    ;; Campaign must be completed (not active)
+    (asserts! (not (get active campaign)) ERR_CAMPAIGN_ACTIVE)
+    ;; Validate input amounts
+    (asserts! (> funds-used u0) ERR_INVALID_AMOUNT)
+    (asserts! (> beneficiaries-reached u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= funds-used (+ (get raised-amount campaign) (get matching-pool campaign))) ERR_INVALID_AMOUNT)
+    
+    ;; Create impact report
+    (map-set impact-reports report-id {
+      campaign-id: campaign-id,
+      creator: tx-sender,
+      title: title,
+      description: description,
+      evidence-url: evidence-url,
+      funds-used: funds-used,
+      beneficiaries-reached: beneficiaries-reached,
+      submission-block: stacks-block-height,
+      verification-end-block: verification-end,
+      verification-votes-for: u0,
+      verification-votes-against: u0,
+      total-verification-stake: u0,
+      verified: false,
+      impact-score: u0,
+      active: true
+    })
+    
+    ;; Update creator record
+    (map-set creator-impact-record tx-sender
+      (merge creator-record {
+        total-reports-submitted: (+ (get total-reports-submitted creator-record) u1),
+        last-report-block: stacks-block-height
+      }))
+    
+    ;; Update campaign history
+    (let ((campaign-history (default-to { total-reports: u0, verified-reports: u0, average-impact-score: u0, total-funds-tracked: u0, total-beneficiaries: u0, trust-rating: u0 } 
+                                        (map-get? campaign-impact-history campaign-id))))
+      (map-set campaign-impact-history campaign-id
+        (merge campaign-history {
+          total-reports: (+ (get total-reports campaign-history) u1),
+          total-funds-tracked: (+ (get total-funds-tracked campaign-history) funds-used),
+          total-beneficiaries: (+ (get total-beneficiaries campaign-history) beneficiaries-reached)
+        })))
+    
+    ;; Award reputation points for transparency
+    (award-reputation-points tx-sender u300 "impact-report")
+    (var-set next-impact-report-id (+ report-id u1))
+    (ok report-id)
+  )
+)
+
+(define-public (verify-impact-report (report-id uint) (support bool) (evidence-provided bool) (comments (string-ascii 200)))
+  (let ((report (unwrap! (map-get? impact-reports report-id) ERR_IMPACT_REPORT_NOT_FOUND))
+        (verifier-stake (default-to u0 (map-get? user-stakes tx-sender))))
+    
+    ;; Verification period must be active
+    (asserts! (get active report) ERR_VERIFICATION_ENDED)
+    (asserts! (< stacks-block-height (get verification-end-block report)) ERR_VERIFICATION_ENDED)
+    ;; Verifier must have minimum stake
+    (asserts! (>= verifier-stake (var-get minimum-stake)) ERR_MINIMUM_STAKE_REQUIRED)
+    ;; Cannot verify own report
+    (asserts! (not (is-eq tx-sender (get creator report))) ERR_NOT_AUTHORIZED)
+    ;; Cannot verify twice
+    (asserts! (is-none (map-get? impact-verifications { report-id: report-id, verifier: tx-sender })) ERR_ALREADY_VERIFIED)
+    
+    ;; Record verification vote
+    (map-set impact-verifications { report-id: report-id, verifier: tx-sender }
+      { 
+        vote: support, 
+        stake: verifier-stake, 
+        evidence-provided: evidence-provided,
+        verification-comments: comments,
+        block-height: stacks-block-height 
+      })
+    
+    ;; Update report vote counts
+    (if support
+      (map-set impact-reports report-id
+        (merge report { 
+          verification-votes-for: (+ (get verification-votes-for report) verifier-stake),
+          total-verification-stake: (+ (get total-verification-stake report) verifier-stake)
+        }))
+      (map-set impact-reports report-id
+        (merge report { 
+          verification-votes-against: (+ (get verification-votes-against report) verifier-stake),
+          total-verification-stake: (+ (get total-verification-stake report) verifier-stake)
+        })))
+    
+    ;; Add to verifiers list
+    (map-set impact-verifiers report-id
+      (unwrap! (as-max-len? (append (default-to (list) (map-get? impact-verifiers report-id)) tx-sender) u50) ERR_INVALID_AMOUNT))
+    
+    ;; Award reputation for verification participation
+    (award-reputation-points tx-sender (if evidence-provided u150 u100) "verification")
+    (ok true)
+  )
+)
+
+(define-public (finalize-impact-verification (report-id uint))
+  (let ((report (unwrap! (map-get? impact-reports report-id) ERR_IMPACT_REPORT_NOT_FOUND))
+        (campaign-id (get campaign-id report))
+        (creator (get creator report)))
+    
+    ;; Verification period must have ended
+    (asserts! (>= stacks-block-height (get verification-end-block report)) ERR_VERIFICATION_ACTIVE)
+    (asserts! (get active report) ERR_VERIFICATION_ENDED)
+    
+    (let ((votes-for (get verification-votes-for report))
+          (votes-against (get verification-votes-against report))
+          (total-stake (get total-verification-stake report))
+          (verification-passed (> votes-for votes-against))
+          (impact-score (if verification-passed 
+                          (calculate-impact-score report)
+                          u0)))
+      
+      ;; Update report with final verification result
+      (map-set impact-reports report-id
+        (merge report {
+          verified: verification-passed,
+          impact-score: impact-score,
+          active: false
+        }))
+      
+      ;; Update creator record
+      (let ((creator-record (default-to { total-reports-submitted: u0, verified-reports: u0, cumulative-impact-score: u0, reliability-score: u0, eligible-for-matching: true, last-report-block: u0 } 
+                                        (map-get? creator-impact-record creator))))
+        (map-set creator-impact-record creator
+          (merge creator-record {
+            verified-reports: (if verification-passed (+ (get verified-reports creator-record) u1) (get verified-reports creator-record)),
+            cumulative-impact-score: (+ (get cumulative-impact-score creator-record) impact-score),
+            reliability-score: (calculate-reliability-score creator-record verification-passed),
+            eligible-for-matching: (>= (calculate-reliability-score creator-record verification-passed) u70)
+          })))
+      
+      ;; Update campaign history
+      (let ((campaign-history (default-to { total-reports: u0, verified-reports: u0, average-impact-score: u0, total-funds-tracked: u0, total-beneficiaries: u0, trust-rating: u0 } 
+                                          (map-get? campaign-impact-history campaign-id))))
+        (map-set campaign-impact-history campaign-id
+          (merge campaign-history {
+            verified-reports: (if verification-passed (+ (get verified-reports campaign-history) u1) (get verified-reports campaign-history)),
+            average-impact-score: (if verification-passed 
+                                    (/ (+ (* (get average-impact-score campaign-history) (get verified-reports campaign-history)) impact-score) 
+                                       (+ (get verified-reports campaign-history) u1))
+                                    (get average-impact-score campaign-history)),
+            trust-rating: (calculate-campaign-trust-rating campaign-id)
+          })))
+      
+      ;; Reward verifiers if verification was successful
+      (if verification-passed
+        (distribute-verification-rewards report-id total-stake)
+        true)
+      
+      ;; Bonus reputation for verified impact
+      (if verification-passed
+        (award-reputation-points creator (* impact-score u2) "verified-impact")
+        true)
+      
+      (ok verification-passed)
+    )
+  )
+)
+
 (define-read-only (get-campaign (campaign-id uint))
   (map-get? campaigns campaign-id)
 )
@@ -559,3 +806,107 @@
     (+ base-amount (/ (* base-amount bonus-percentage) u100))
   )
 )
+
+;; Impact verification helper functions
+(define-private (calculate-impact-score (report (tuple (campaign-id uint) (creator principal) (title (string-ascii 100)) (description (string-ascii 1000)) (evidence-url (string-ascii 500)) (funds-used uint) (beneficiaries-reached uint) (submission-block uint) (verification-end-block uint) (verification-votes-for uint) (verification-votes-against uint) (total-verification-stake uint) (verified bool) (impact-score uint) (active bool))))
+  (let ((funds-efficiency (/ (* (get beneficiaries-reached report) u100) (get funds-used report)))
+        (verification-strength (/ (* (get verification-votes-for report) u100) (get total-verification-stake report)))
+        (base-score (/ (+ funds-efficiency verification-strength) u2)))
+    (if (> base-score u100) u100 base-score)
+  )
+)
+
+(define-private (calculate-reliability-score (creator-record (tuple (total-reports-submitted uint) (verified-reports uint) (cumulative-impact-score uint) (reliability-score uint) (eligible-for-matching bool) (last-report-block uint))) (verification-passed bool))
+  (let ((total-reports (get total-reports-submitted creator-record))
+        (verified-count (if verification-passed (+ (get verified-reports creator-record) u1) (get verified-reports creator-record))))
+    (if (> total-reports u0)
+      (/ (* verified-count u100) total-reports)
+      u0)
+  )
+)
+
+(define-private (calculate-campaign-trust-rating (campaign-id uint))
+  (let ((history (default-to { total-reports: u0, verified-reports: u0, average-impact-score: u0, total-funds-tracked: u0, total-beneficiaries: u0, trust-rating: u0 } 
+                             (map-get? campaign-impact-history campaign-id))))
+    (if (> (get total-reports history) u0)
+      (/ (+ (get average-impact-score history) 
+            (/ (* (get verified-reports history) u100) (get total-reports history))) u2)
+      u50)
+  )
+)
+
+(define-private (distribute-verification-rewards (report-id uint) (total-stake uint))
+  (let ((safe-stake (if (> total-stake u0) total-stake u1))
+        (reward-per-stake (/ (var-get reward-pool) safe-stake)))
+    (var-set reward-pool (- (var-get reward-pool) (* reward-per-stake total-stake)))
+    true
+  )
+)
+
+(define-public (check-creator-eligibility (creator principal))
+  (let ((creator-record (default-to { total-reports-submitted: u0, verified-reports: u0, cumulative-impact-score: u0, reliability-score: u0, eligible-for-matching: true, last-report-block: u0 } 
+                                    (map-get? creator-impact-record creator))))
+    (ok (and (get eligible-for-matching creator-record) 
+             (>= (get reliability-score creator-record) u70)))
+  )
+)
+
+(define-public (update-verification-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set verification-period new-period)
+    (ok true)
+  )
+)
+
+;; Enhanced campaign creation with impact eligibility check
+(define-public (create-verified-campaign (title (string-ascii 100)) (description (string-ascii 500)) (target-amount uint) (duration uint))
+  (let ((creator-eligible (unwrap! (check-creator-eligibility tx-sender) ERR_INSUFFICIENT_IMPACT_SCORE)))
+    (asserts! creator-eligible ERR_INSUFFICIENT_IMPACT_SCORE)
+    (create-campaign title description target-amount duration)
+  )
+)
+
+;; Impact reporting read-only functions
+(define-read-only (get-impact-report (report-id uint))
+  (map-get? impact-reports report-id)
+)
+
+(define-read-only (get-impact-verification (report-id uint) (verifier principal))
+  (map-get? impact-verifications { report-id: report-id, verifier: verifier })
+)
+
+(define-read-only (get-campaign-impact-history (campaign-id uint))
+  (default-to { total-reports: u0, verified-reports: u0, average-impact-score: u0, total-funds-tracked: u0, total-beneficiaries: u0, trust-rating: u0 } 
+              (map-get? campaign-impact-history campaign-id))
+)
+
+(define-read-only (get-creator-impact-record (creator principal))
+  (default-to { total-reports-submitted: u0, verified-reports: u0, cumulative-impact-score: u0, reliability-score: u0, eligible-for-matching: true, last-report-block: u0 } 
+              (map-get? creator-impact-record creator))
+)
+
+(define-read-only (get-impact-verifiers (report-id uint))
+  (default-to (list) (map-get? impact-verifiers report-id))
+)
+
+(define-read-only (get-next-impact-report-id)
+  (var-get next-impact-report-id)
+)
+
+(define-read-only (get-verification-period)
+  (var-get verification-period)
+)
+
+(define-read-only (is-creator-eligible-for-matching (creator principal))
+  (let ((creator-record (get-creator-impact-record creator)))
+    (and (get eligible-for-matching creator-record) 
+         (>= (get reliability-score creator-record) u70))
+  )
+)
+
+
+
+
+
+
